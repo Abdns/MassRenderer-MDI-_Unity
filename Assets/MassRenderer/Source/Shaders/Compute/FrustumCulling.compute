@@ -1,0 +1,103 @@
+#pragma kernel ResetCounters
+#pragma kernel FrustumCull
+#pragma kernel UpdateDrawArgs
+
+#define CULL_BLOCK_SIZE 128
+
+float4 _FrustumPlanes[6];
+float  _BoundingSphereRadius;
+int    _TotalInstanceCount;
+int    _PrototypeCount;
+int    _CommandCount;
+
+float4x4 _CullGlobalTransform;
+
+struct InstanceData
+{
+    int      meshIndex;
+    int      textureSkinIndex;
+    int      animationIndex;
+    float    animationSpeed;
+    float4x4 objectToWorld;
+};
+
+StructuredBuffer<InstanceData>   _InputBuffer;
+RWStructuredBuffer<InstanceData> _OutputBuffer;
+RWStructuredBuffer<uint>         _VisibleCountPerPrototype;
+StructuredBuffer<uint>           _PrototypeOffsets;
+StructuredBuffer<uint>           _SegmentToPrototype;
+RWStructuredBuffer<uint>         _StagingDrawArgs;
+StructuredBuffer<uint>           _OriginalDrawArgs;
+
+bool IsInsideFrustum(float3 worldPos, float radius)
+{
+    [unroll]
+    for (int i = 0; i < 6; i++)
+    {
+        float dist = dot(_FrustumPlanes[i].xyz, worldPos) + _FrustumPlanes[i].w;
+        if (dist < -radius)
+            return false;
+    }
+    return true;
+}
+
+float GetMaxScale(float4x4 mat)
+{
+    float sx = length(float3(mat[0][0], mat[1][0], mat[2][0]));
+    float sy = length(float3(mat[0][1], mat[1][1], mat[2][1]));
+    float sz = length(float3(mat[0][2], mat[1][2], mat[2][2]));
+    return max(sx, max(sy, sz));
+}
+
+[numthreads(64, 1, 1)]
+void ResetCounters(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_PrototypeCount)
+        return;
+
+    _VisibleCountPerPrototype[id.x] = 0;
+}
+
+[numthreads(CULL_BLOCK_SIZE, 1, 1)]
+void FrustumCull(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_TotalInstanceCount)
+        return;
+
+    InstanceData instance = _InputBuffer[id.x];
+
+    float4 globalOrigin = mul(_CullGlobalTransform, float4(0, 0, 0, 1));
+    float4 worldPos4 = mul(instance.objectToWorld, globalOrigin);
+    float3 worldPos = worldPos4.xyz;
+
+    float instanceScale = GetMaxScale(instance.objectToWorld);
+    float globalScale = GetMaxScale(_CullGlobalTransform);
+    float effectiveRadius = _BoundingSphereRadius * instanceScale * globalScale;
+
+    if (IsInsideFrustum(worldPos, effectiveRadius))
+    {
+        uint protoIndex = (uint)instance.meshIndex;
+        uint visibleIndex;
+        InterlockedAdd(_VisibleCountPerPrototype[protoIndex], 1, visibleIndex);
+
+        uint outputIndex = _PrototypeOffsets[protoIndex] + visibleIndex;
+        _OutputBuffer[outputIndex] = instance;
+    }
+}
+
+[numthreads(64, 1, 1)]
+void UpdateDrawArgs(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_CommandCount)
+        return;
+
+    uint baseIdx = id.x * 5;
+
+    _StagingDrawArgs[baseIdx + 0] = _OriginalDrawArgs[baseIdx + 0];
+    _StagingDrawArgs[baseIdx + 2] = _OriginalDrawArgs[baseIdx + 2];
+    _StagingDrawArgs[baseIdx + 3] = _OriginalDrawArgs[baseIdx + 3];
+    _StagingDrawArgs[baseIdx + 4] = _OriginalDrawArgs[baseIdx + 4];
+
+    uint protoIdx = _SegmentToPrototype[id.x];
+    _StagingDrawArgs[baseIdx + 1] = _VisibleCountPerPrototype[protoIdx];
+}

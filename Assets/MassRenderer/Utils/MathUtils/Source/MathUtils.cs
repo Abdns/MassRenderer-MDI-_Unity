@@ -3,17 +3,17 @@ using UnityEngine;
 namespace MassRendererSystem.Utils
 {
     /// <summary>
-    /// Mathematical utility functions for mass rendering calculations.
+    /// Utility class for mathematical operations used in mass rendering simulations.
     /// </summary>
     public static class MathUtils
     {
         /// <summary>
-        /// Generates a random position within a rectangular area centered at the given point.
-        /// Randomizes X and Z coordinates while preserving the Y coordinate.
+        /// Generates a random position within a rectangular area on the XZ plane.
+        /// Y coordinate is taken directly from the center point.
         /// </summary>
-        /// <param name="center">Center point of the spawn area.</param>
-        /// <param name="areaSize">Size of the area (X = width, Z = depth).</param>
-        /// <returns>Random position within the specified area.</returns>
+        /// <param name="center">Center point of the distribution area.</param>
+        /// <param name="areaSize">Size of the area (X and Z dimensions are used).</param>
+        /// <returns>A random position within the specified area bounds.</returns>
         public static Vector3 GetSpreadPosition(Vector3 center, Vector3 areaSize)
         {
             float halfX = areaSize.x * 0.5f;

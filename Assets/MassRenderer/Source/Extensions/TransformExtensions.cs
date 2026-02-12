@@ -2,50 +2,35 @@ using System.Text;
 using UnityEngine;
 
 /// <summary>
-/// Extension methods for Unity Transform and Component hierarchy operations.
+/// Extension methods for Unity Transform component.
 /// </summary>
 public static class TransformExtensions
 {
     /// <summary>
-    /// Finds a matching component in a cloned hierarchy by traversing the same relative path.
-    /// Useful for finding corresponding components in instantiated prefab copies.
+    /// Finds a matching component in a cloned hierarchy by traversing the same path.
     /// </summary>
-    /// <typeparam name="T">The type of component to find.</typeparam>
-    /// <param name="originalComponent">The original component to find a match for.</param>
-    /// <param name="ghostRoot">The root of the cloned hierarchy.</param>
-    /// <param name="originalRoot">The root of the original hierarchy.</param>
-    /// <returns>The matching component in the cloned hierarchy, or null if not found.</returns>
-    public static T FindMatchingComponentIn<T>(this T originalComponent, GameObject ghostRoot, GameObject originalRoot) where T : Component
+    public static T FindMatchingComponentIn<T>(this T originalComponent, GameObject ghostRoot, GameObject originalRoot)
+        where T : Component
     {
+        if (originalComponent == null || ghostRoot == null || originalRoot == null) return null;
+
         if (originalComponent.gameObject == originalRoot)
         {
             return ghostRoot.GetComponent<T>();
         }
 
         string path = GetHierarchyPath(originalComponent.transform, originalRoot.transform);
-
         Transform foundTransform = ghostRoot.transform.Find(path);
 
-        if (foundTransform != null)
-        {
-            return foundTransform.GetComponent<T>();
-        }
-
-        Debug.LogWarning($"[TransformExtensions] Not found {originalComponent.name} / {ghostRoot.name}");
-
-        return null;
+        return foundTransform != null ? foundTransform.GetComponent<T>() : null;
     }
 
     /// <summary>
-    /// Gets the relative hierarchy path from a root transform to a target transform.
-    /// The path uses "/" as separator, compatible with Transform.Find().
+    /// Gets the hierarchy path from target transform to root transform.
     /// </summary>
-    /// <param name="target">The target transform to get the path to.</param>
-    /// <param name="root">The root transform to calculate the path from.</param>
-    /// <returns>A "/" separated path string, or empty string if target equals root.</returns>
     public static string GetHierarchyPath(this Transform target, Transform root)
     {
-        if (target == root) return "";
+        if (target == null || root == null || target == root) return string.Empty;
 
         var sb = new StringBuilder();
         sb.Append(target.name);
@@ -55,7 +40,6 @@ public static class TransformExtensions
         {
             sb.Insert(0, "/");
             sb.Insert(0, current.name);
-
             current = current.parent;
         }
 

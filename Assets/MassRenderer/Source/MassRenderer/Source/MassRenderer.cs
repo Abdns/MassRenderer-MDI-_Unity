@@ -3,13 +3,13 @@ using System;
 using System.Runtime.InteropServices;
 using UnityEngine;
 using VATBakerSystem;
-using static UnityEngine.GraphicsBuffer;
 
 namespace MassRendererSystem
 {
     /// <summary>
-    /// High-performance GPU-based instanced renderer using Multi-Draw Indirect (MDI) rendering.
+    /// High-performance mass renderer using GPU instancing with indirect draw calls.
     /// Supports Vertex Animation Textures (VAT) for skeletal animation playback on GPU.
+    /// Optionally supports GPU-based per-instance frustum culling via compute shader.
     /// </summary>
     public sealed class MassRenderer : IDisposable
     {
@@ -25,6 +25,13 @@ namespace MassRendererSystem
         private ComputeBuffer _instancesIdOffset;
         private ComputeBuffer _instanceDataBuffer;
         private ComputeBuffer _vatClipsDataBuffer;
+
+        private FrustumCuller _frustumCuller;
+        private Camera _cullingCamera;
+        private Matrix4x4 _globalTransform = Matrix4x4.identity;
+
+        private GraphicsBuffer.IndirectDrawIndexedArgs[] _cachedDrawCommands;
+        private int[] _cachedOffsets;
 
         private bool _hasMaterial;
         private bool _isInitialized;
@@ -57,7 +64,7 @@ namespace MassRendererSystem
         /// <param name="mrParams">Renderer configuration parameters.</param>
         public MassRenderer(RenderStaticData data, MassRendererParams mrParams)
         {
-            _mrData = data;
+            _mrData = data ?? throw new ArgumentNullException(nameof(data));
             _mrParams = mrParams;
         }
 
@@ -69,7 +76,7 @@ namespace MassRendererSystem
         /// <param name="mdiMaterial">Custom material for MDI rendering.</param>
         public MassRenderer(RenderStaticData data, MassRendererParams mrParams, Material mdiMaterial)
         {
-            _mrData = data;
+            _mrData = data ?? throw new ArgumentNullException(nameof(data));
             _mrParams = mrParams;
             _mrMaterial = mdiMaterial;
         }
@@ -92,82 +99,148 @@ namespace MassRendererSystem
                 throw new InvalidOperationException("MassRenderer already initialized.");
             }
 
-            if(_mrMaterial == null)
+            if (_mrMaterial == null)
             {
                 CreateMaterialFallback();
             }
 
             CreateBuffers();
             BuildRenderParams();
-            UpdateInstancesBuffers();
+
+            _cullingCamera = _mrParams.CullingCamera;
 
             _isInitialized = true;
         }
 
         /// <summary>
         /// Renders all instances using GPU instancing with Multi-Draw Indirect.
-        /// Should be called every frame.
+        /// When frustum culling is enabled, first dispatches the culling compute shader,
+        /// then renders only visible instances.
         /// </summary>
         public void Render()
         {
-            UpdateInstancesBuffers();
+            if (!_isInitialized || _isDisposed)
+            {
+                return;
+            }
 
-            Graphics.RenderMeshIndirect(_rParams, _mrData.MergedPrototypeMeshes, _multiDrawCommandsBuffer, _mrData.PrototypeMeshes.Count);
+            if (_frustumCuller != null)
+            {
+                Camera cam = _cullingCamera != null ? _cullingCamera : Camera.main;
+
+                if (cam != null)
+                {
+                    _frustumCuller.Cull(cam, _multiDrawCommandsBuffer);
+                }
+                else
+                {
+                    UpdateInstancesBuffers();
+                }
+            }
+            else
+            {
+                UpdateInstancesBuffers();
+            }
+
+            Graphics.RenderMeshIndirect(
+                _rParams,
+                _mrData.MergedPrototypeMeshes,
+                _multiDrawCommandsBuffer,
+                _mrData.PrototypeMeshes.Count);
         }
 
         /// <summary>
         /// Rebuilds the indirect draw commands buffer with new instance counts per prototype mesh.
         /// Call this when the distribution of instances across mesh types changes.
+        /// Also initializes the frustum culler if culling is enabled.
         /// </summary>
         /// <param name="instanceCounts">Array of instance counts for each prototype mesh.</param>
-        /// <exception cref="InvalidOperationException">Thrown if renderer is not initialized.</exception>
         public void RebuildDrawCommands(int[] instanceCounts)
         {
             if (!_isInitialized)
             {
-                throw new InvalidOperationException("MassRenderer not initializes. Call Initialize() first.");
+                throw new InvalidOperationException("MassRenderer not initialized. Call Initialize() first.");
             }
 
             _multiDrawCommandsBuffer?.Release();
 
-            SetCommandsBuffer(_mrData.PrototypeMeshes.Count, instanceCounts, _mrData.PrototypesData.mergedMeshData);
+            PrototypesMeshSegment[] segments = _mrData.PrototypesData.mergedMeshData;
+
+            SetCommandsBuffer(_mrData.PrototypeMeshes.Count, instanceCounts, segments);
 
             BindMaterialData();
+
+            if (_mrParams.IsFrustumCullingEnabled && _mrParams.FrustumCullingShader != null)
+            {
+                InitializeFrustumCuller(instanceCounts, segments);
+            }
         }
 
         /// <summary>
         /// Sets a global transformation matrix applied to all instances.
         /// Useful for positioning the entire crowd/group in world space.
+        /// Also updates the frustum culler's global transform for accurate culling.
         /// </summary>
         /// <param name="globalMatrix">The world transformation matrix to apply.</param>
         public void SetGlobalTransform(Matrix4x4 globalMatrix)
         {
+            _globalTransform = globalMatrix;
+
             if (_mrMaterial != null)
             {
                 _mrMaterial.SetMatrix(MDIShaderIDs.GlobalTransformID, globalMatrix);
             }
+
+            _frustumCuller?.SetGlobalTransform(globalMatrix);
         }
 
+        /// <summary>
+        /// Sets the camera used for frustum culling.
+        /// If not set, Camera.main is used as fallback.
+        /// </summary>
+        /// <param name="camera">Camera to extract frustum planes from.</param>
+        public void SetCullingCamera(Camera camera)
+        {
+            _cullingCamera = camera;
+        }
+
+        /// <summary>
+        /// Builds the RenderParams structure for use with RenderMeshIndirect.
+        /// </summary>
         private void BuildRenderParams()
         {
-            RenderParams rParamas = new RenderParams(_mrMaterial);
-            rParamas.worldBounds = _mrParams.RenderBounds;
-            rParamas.matProps = _propertyBlock;
-            rParamas.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.On;
-            rParamas.receiveShadows = true;
+            RenderParams rParams = new RenderParams(_mrMaterial)
+            {
+                worldBounds = _mrParams.RenderBounds,
+                matProps = _propertyBlock,
+                shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.On,
+                receiveShadows = true
+            };
 
-            _rParams = rParamas;
+            _rParams = rParams;
         }
 
+        /// <summary>
+        /// Updates material buffer bindings for instance data.
+        /// Used when frustum culling is NOT active.
+        /// </summary>
         private void UpdateInstancesBuffers()
         {
             _mrMaterial.SetBuffer(MDIShaderIDs.InstanceDataBufferID, _instanceDataBuffer);
         }
 
+        /// <summary>
+        /// Creates all required GPU compute buffers.
+        /// </summary>
         private void CreateBuffers()
         {
+            int prototypeCount = _mrData.PrototypeMeshes.Count;
+
             _instanceDataBuffer = new ComputeBuffer(_mrParams.InstanceCount, Marshal.SizeOf(typeof(InstanceData)));
-            _instancesIdOffset = new ComputeBuffer(_mrData.PrototypeMeshes.Count, Marshal.SizeOf(typeof(int)));
+            _instancesIdOffset = new ComputeBuffer(prototypeCount, Marshal.SizeOf(typeof(int)));
+
+            _cachedDrawCommands = new GraphicsBuffer.IndirectDrawIndexedArgs[prototypeCount];
+            _cachedOffsets = new int[prototypeCount];
 
             if (_mrParams.IsVATEnable)
             {
@@ -175,6 +248,9 @@ namespace MassRendererSystem
             }
         }
 
+        /// <summary>
+        /// Creates a fallback material when none is provided in the constructor.
+        /// </summary>
         private void CreateMaterialFallback()
         {
             Shader shader = MDIShaderIDs.GetShader(_mrParams.ShaderType);
@@ -184,6 +260,9 @@ namespace MassRendererSystem
             _propertyBlock = new MaterialPropertyBlock();
         }
 
+        /// <summary>
+        /// Binds texture and buffer data to the material.
+        /// </summary>
         private void BindMaterialData()
         {
             _mrMaterial.SetTexture(MDIShaderIDs.TextureSkinsID, _mrData.TextureSkins);
@@ -206,23 +285,69 @@ namespace MassRendererSystem
             }
         }
 
-        private void SetCommandsBuffer(int uniqMeshesCount, int[] meshesPerPrototype, PrototypesMeshSegment[] meshesData)
+        /// <summary>
+        /// Initializes the frustum culler with current instance data.
+        /// </summary>
+        private void InitializeFrustumCuller(int[] instanceCounts, PrototypesMeshSegment[] segments)
         {
-            _multiDrawCommandsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments, uniqMeshesCount, GraphicsBuffer.IndirectDrawIndexedArgs.size);
-            IndirectDrawIndexedArgs[] multiDrawCommands = new IndirectDrawIndexedArgs[uniqMeshesCount];
+            _frustumCuller?.Dispose();
 
-            PopulateIndirectArgs(meshesData, meshesPerPrototype, multiDrawCommands);
+            _frustumCuller = new FrustumCuller(
+                _mrParams.FrustumCullingShader,
+                _mrParams.InstanceCount,
+                _mrData.PrototypeMeshes.Count,
+                _mrParams.BoundingSphereRadius);
 
-            _multiDrawCommandsBuffer.SetData(multiDrawCommands);
+            _frustumCuller.Initialize(_instanceDataBuffer, instanceCounts, segments, _cachedDrawCommands);
+            _frustumCuller.SetGlobalTransform(_globalTransform);
+
+            _mrMaterial.SetBuffer(MDIShaderIDs.InstanceDataBufferID, _frustumCuller.VisibleOutputBuffer);
         }
 
-        private void PopulateIndirectArgs(PrototypesMeshSegment[] segments, int[] meshesPerPrototype, GraphicsBuffer.IndirectDrawIndexedArgs[] args)
+        /// <summary>
+        /// Creates and populates the indirect draw commands buffer.
+        /// Uses cached arrays to avoid runtime allocations.
+        /// When frustum culling is enabled, the buffer also has CopyDestination target
+        /// so that Graphics.CopyBuffer can write patched draw args from the staging buffer.
+        /// </summary>
+        /// <param name="uniqMeshesCount">Number of unique mesh prototypes.</param>
+        /// <param name="meshesPerPrototype">Array of instance counts per prototype.</param>
+        /// <param name="meshesData">Mesh segment data for merged mesh.</param>
+        private void SetCommandsBuffer(int uniqMeshesCount, int[] meshesPerPrototype, PrototypesMeshSegment[] meshesData)
         {
-            int[] indecesOffsets = CalculateInstanceOffsets(meshesPerPrototype);
+            bool needsCulling = _mrParams.IsFrustumCullingEnabled && _mrParams.FrustumCullingShader != null;
+
+            GraphicsBuffer.Target target = needsCulling
+                ? GraphicsBuffer.Target.IndirectArguments | GraphicsBuffer.Target.CopyDestination
+                : GraphicsBuffer.Target.IndirectArguments;
+
+            _multiDrawCommandsBuffer = new GraphicsBuffer(
+                target,
+                uniqMeshesCount,
+                GraphicsBuffer.IndirectDrawIndexedArgs.size);
+
+            PopulateIndirectArgs(meshesData, meshesPerPrototype, _cachedDrawCommands);
+
+            _multiDrawCommandsBuffer.SetData(_cachedDrawCommands);
+        }
+
+        /// <summary>
+        /// Populates the indirect draw arguments for each mesh prototype.
+        /// Uses cached offset array to avoid runtime allocations.
+        /// </summary>
+        /// <param name="segments">Mesh segment information.</param>
+        /// <param name="meshesPerPrototype">Instance counts per prototype.</param>
+        /// <param name="args">Output array of indirect draw arguments.</param>
+        private void PopulateIndirectArgs(
+            PrototypesMeshSegment[] segments,
+            int[] meshesPerPrototype,
+            GraphicsBuffer.IndirectDrawIndexedArgs[] args)
+        {
+            CalculateOffsets(meshesPerPrototype, _cachedOffsets);
 
             if (_instancesIdOffset != null)
             {
-                _instancesIdOffset.SetData(indecesOffsets);
+                _instancesIdOffset.SetData(_cachedOffsets);
             }
 
             for (int i = 0; i < segments.Length; i++)
@@ -234,24 +359,23 @@ namespace MassRendererSystem
                 args[i].indexCountPerInstance = (uint)seg.IndexCount;
                 args[i].startIndex = (uint)seg.StartIndex;
                 args[i].instanceCount = (uint)meshesPerPrototype[meshIdx];
-                args[i].startInstance = (uint)indecesOffsets[meshIdx];
+                args[i].startInstance = (uint)_cachedOffsets[meshIdx];
             }
         }
 
-        private int[] CalculateInstanceOffsets(int[] instanceCounts)
+        /// <summary>
+        /// Calculates instance offsets.
+        /// </summary>
+        /// <param name="instanceCounts">Input array of instance counts.</param>
+        /// <param name="offsets">Output array to fill with offsets.</param>
+        private static void CalculateOffsets(int[] instanceCounts, int[] offsets)
         {
-            int count = instanceCounts.Length;
-            int[] offsets = new int[count];
-
             int currentOffset = 0;
-
-            for (int i = 0; i < count; i++)
+            for (int i = 0; i < instanceCounts.Length; i++)
             {
                 offsets[i] = currentOffset;
                 currentOffset += instanceCounts[i];
             }
-
-            return offsets;
         }
 
         /// <summary>
@@ -266,6 +390,9 @@ namespace MassRendererSystem
 
             _isDisposed = true;
 
+            _frustumCuller?.Dispose();
+            _frustumCuller = null;
+
             _instanceDataBuffer?.Release();
             _instanceDataBuffer = null;
 
@@ -277,7 +404,6 @@ namespace MassRendererSystem
 
             _multiDrawCommandsBuffer?.Release();
             _multiDrawCommandsBuffer = null;
-
 
             if (_mrMaterial != null && _hasMaterial)
             {

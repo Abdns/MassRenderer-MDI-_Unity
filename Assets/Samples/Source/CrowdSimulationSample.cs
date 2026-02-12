@@ -3,58 +3,67 @@ using MassRendererSystem.Data;
 using UnityEngine;
 
 /// <summary>
-/// Sample MonoBehaviour demonstrating animated crowd rendering with MassRenderer.
-/// Uses compute shader for GPU-based crowd simulation with VAT animations.
+/// Sample MonoBehaviour demonstrating GPU-accelerated crowd simulation.
+/// Shows how to set up and use MassRenderer with CrowdSimulation for animated character rendering.
+/// Supports optional GPU frustum culling for improved performance.
 /// </summary>
 public class CrowdSimulationSample : MonoBehaviour
 {
     [Header("Settings")]
-    [SerializeField] private RenderStaticData _mrData;
-    [SerializeField] private Material _mrMaterial;
-    [SerializeField] private ComputeShader _cs;
-    [SerializeField] private int _instanceCount = 512;
-    [SerializeField] private bool _hasVAT = true;
+    public RenderStaticData data;
+    public ComputeShader computeCS;
+    public Bounds renderBounds = new Bounds(Vector3.zero, Vector3.one * 10000f);
+    public int instanceCount = 512;
+    public bool useVat = true;
+    public Material mdi;
+
+    [Header("Frustum Culling")]
+    public bool enableFrustumCulling = true;
+    public ComputeShader frustumCullingShader;
+    public float boundingSphereRadius = 2f;
+    public Camera cullingCamera;
 
     [Header("Transform")]
-    [SerializeField] private Vector3 _position = Vector3.zero;
-    [SerializeField] private Vector3 _angle = new Vector3(0, 0, 0);
-    [SerializeField] private Vector3 _scale = new Vector3(1f, 1f, 1f);
+    public Vector3 euler = new Vector3(0, 45, 0);
+    public Vector3 scale = new Vector3(1.5f, 1.5f, 1.5f);
 
     private MassRenderer _renderer;
-    private CrowdSimulation _simulationSystem;
-    private Bounds _renderBounds = new Bounds(Vector3.zero, Vector3.one * 10000f);
+    private CrowdSimulation _crowdSimulation;
 
     private void Start()
     {
         MassRendererParams msParams = new MassRendererParams
         {
-            IsVATEnable = _hasVAT,
-            InstanceCount = _instanceCount,
-            RenderBounds = _renderBounds,
-            ShaderType = MassRenderShaderType.Lit
+            IsVATEnable = useVat,
+            InstanceCount = instanceCount,
+            RenderBounds = renderBounds,
+            ShaderType = MassRenderShaderType.Lit,
+            IsFrustumCullingEnabled = enableFrustumCulling,
+            FrustumCullingShader = frustumCullingShader,
+            BoundingSphereRadius = boundingSphereRadius,
+            CullingCamera = cullingCamera
         };
 
-        _renderer = new MassRenderer(_mrData, msParams, _mrMaterial);
-
+        _renderer = new MassRenderer(data, msParams, mdi);
         _renderer.Initialize();
         UpdateTransform();
 
-        _simulationSystem = new CrowdSimulation(_instanceCount, _renderer.InstancesDataBuffer, _mrData, _cs);
-        _simulationSystem.Initialize();
+        _crowdSimulation = new CrowdSimulation(instanceCount, _renderer.InstancesDataBuffer, data, computeCS);
+        _crowdSimulation.Initialize();
 
-        _renderer.RebuildDrawCommands(_simulationSystem.InstanceCounts);
+        _renderer.RebuildDrawCommands(_crowdSimulation.InstanceCounts);
     }
 
     private void Update()
     {
-        _simulationSystem.Simulate();
-        _renderer.Render();
+        _crowdSimulation?.Simulate();
+        _renderer?.Render();
     }
 
     private void OnDestroy()
     {
         _renderer?.Dispose();
-        _simulationSystem?.ReleaseBuffers();
+        _crowdSimulation?.ReleaseBuffers();
     }
 
     private void OnValidate()
@@ -66,7 +75,7 @@ public class CrowdSimulationSample : MonoBehaviour
     {
         if (_renderer != null)
         {
-            Matrix4x4 globalMatrix = Matrix4x4.TRS(_position, Quaternion.Euler(_angle), _scale);
+            Matrix4x4 globalMatrix = Matrix4x4.TRS(transform.position, Quaternion.Euler(euler), scale);
             _renderer.SetGlobalTransform(globalMatrix);
         }
     }
